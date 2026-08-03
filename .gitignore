@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# OPA executable
+opa.exe
+
+# Generated reports
+output/
+
+# Generated infrastructure
+infrastructure/normalised_infrastructure.json
+
+# Terraform generated files
+**/.terraform/
+**/.terraform.lock.hcl
+**/tfplan
+
+# IDE
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db

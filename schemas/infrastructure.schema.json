@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Normalised Infrastructure Schema",
+  "description": "Defines the generic infrastructure format used by the policy verification pipeline.",
+  "type": "object",
+  "required": [
+    "resources"
+  ],
+  "properties": {
+    "resources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "provider",
+          "original_type",
+          "resource_type",
+          "controls"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "provider": {
+            "type": "string",
+            "minLength": 1
+          },
+          "original_type": {
+            "type": "string",
+            "minLength": 1
+          },
+          "resource_type": {
+            "type": "string",
+            "enum": [
+              "storage",
+              "database",
+              "compute",
+              "network",
+              "identity",
+              "logging",
+              "monitoring",
+              "secrets",
+              "encryption_key",
+              "governance",
+              "processing_system"
+            ]
+          },
+          "controls": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "boolean",
+                "number",
+                "string",
+                "array"
+              ]
+            }
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

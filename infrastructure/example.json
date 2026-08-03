@@ -1,0 +1,35 @@
+{
+  "resources": [
+    {
+      "id": "customer-data-bucket",
+      "provider": "aws",
+      "original_type": "aws_s3_bucket",
+      "resource_type": "storage",
+      "controls": {
+        "encryption_enabled": true,
+        "public_access": false,
+        "logging_enabled": true,
+        "versioning_enabled": true
+      },
+      "metadata": {
+        "source": "example",
+        "address": "aws_s3_bucket.customer_data"
+      }
+    },
+    {
+      "id": "customer-database",
+      "provider": "aws",
+      "original_type": "aws_db_instance",
+      "resource_type": "database",
+      "controls": {
+        "encryption_enabled": true,
+        "backup_enabled": true,
+        "multi_az_enabled": false
+      },
+      "metadata": {
+        "source": "example",
+        "address": "aws_db_instance.customer_database"
+      }
+    }
+  ]
+}

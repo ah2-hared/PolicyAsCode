@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Policy Schema",
+  "description": "Schema for structured policy requirements used by the policy-to-infrastructure verification framework.",
+  "type": "array",
+  "minItems": 1,
+  "items": {
+    "type": "object",
+    "required": ["id","policy_source","reference","title","description","subject","action","resource_type","control","operator","expected_value","cia_category","severity","automation_level","verification_notes","message","tags"],
+    "properties": {
+      "id": {"type": "string", "minLength": 1},
+      "policy_source": {"type": "string", "minLength": 1},
+      "reference": {"type": "string", "minLength": 1},
+      "title": {"type": "string", "minLength": 1},
+      "description": {"type": "string", "minLength": 1},
+      "subject": {"type": "string", "minLength": 1},
+      "action": {"type": "string", "minLength": 1},
+      "resource_type": {"type": "string", "minLength": 1},
+      "control": {"type": "string", "minLength": 1},
+      "operator": {"type": "string", "enum": ["equals","not_equals","greater_than","greater_than_or_equal","less_than","less_than_or_equal","contains","not_contains","all_of","required_if","manual_review"]},
+      "expected_value": {
+        "oneOf": [
+          {"type": "boolean"},
+          {"type": "number"},
+          {"type": "string"},
+          {"type": "array", "minItems": 1, "items": {"type": ["string","number","boolean"]}},
+          {
+            "type": "object",
+            "required": ["if_control","if_value","required_control","required_value"],
+            "properties": {
+              "if_control": {"type": "string", "minLength": 1},
+              "if_value": {"oneOf": [{"type":"boolean"},{"type":"number"},{"type":"string"}]},
+              "required_control": {"type": "string", "minLength": 1},
+              "required_value": {"oneOf": [{"type":"boolean"},{"type":"number"},{"type":"string"}]}
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
+      "cia_category": {"type": "string", "enum": ["Confidentiality","Integrity","Availability","Combined"]},
+      "severity": {"type": "string", "enum": ["Low","Medium","High","Critical"]},
+      "automation_level": {"type": "string", "enum": ["full","partial","manual"]},
+      "verification_notes": {"type": "string", "minLength": 1},
+      "message": {"type": "string", "minLength": 1},
+      "tags": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type":"string","minLength":1}}
+    },
+    "additionalProperties": false
+  }
+}
