@@ -59,10 +59,10 @@ def load_evaluation_results(
     required_fields = {
         "infrastructure_file",
         "rego_file",
-        "violation_count",
-        "manual_review_count",
-        "violations",
-        "manual_reviews",
+        "fail",
+        "unknown",
+        "not_applicable",
+        "pass",
     }
 
     missing_fields = required_fields - data.keys()
@@ -75,15 +75,11 @@ def load_evaluation_results(
             f"{missing}"
         )
 
-    if not isinstance(data["violations"], list):
-        raise ValueError(
-            "The violations field must contain a list."
-        )
-
-    if not isinstance(data["manual_reviews"], list):
-        raise ValueError(
-            "The manual_reviews field must contain a list."
-        )
+    for field_name in ("fail", "unknown", "not_applicable", "pass"):
+        if not isinstance(data[field_name], list):
+            raise ValueError(
+                f"The '{field_name}' field must contain a list."
+            )
 
     return data
 
@@ -134,18 +130,18 @@ def sort_by_severity(
 
 
 def build_recommendation(
-    violation: dict[str, Any],
+    item: dict[str, Any],
 ) -> str:
     """
-    Generate a basic recommendation based on the failed control.
+    Generate a basic recommendation based on a failed control.
     """
-    control = violation.get(
+    control = item.get(
         "control",
         "unknown_control",
     )
 
-    expected = violation.get("expected_value")
-    operator = violation.get("operator", "equals")
+    expected = item.get("expected_value")
+    operator = item.get("operator", "equals")
 
     readable_control = control.replace("_", " ")
 
@@ -198,22 +194,9 @@ def build_recommendation(
         )
 
     if operator == "all_of":
-        missing_control = violation.get(
-            "missing_or_disabled_control"
-        )
-
-        if missing_control:
-            readable_missing = str(
-                missing_control
-            ).replace("_", " ")
-
-            return (
-                "Enable or configure the required control: "
-                f"{readable_missing}."
-            )
-
         return (
-            "Enable every control required by this composite policy."
+            "Enable or configure the required control: "
+            f"{readable_control}."
         )
 
     if operator == "required_if":
@@ -233,66 +216,62 @@ def build_report_data(
 ) -> dict[str, Any]:
     """
     Convert raw OPA results into a structured report.
+
+    Every policy result is exactly one of four statuses:
+
+        fail            observed, violates the policy
+        unknown         could not be determined from the
+                         infrastructure -- never assumed compliant
+        not_applicable  the policy's question does not apply to this
+                         resource
+        pass            observed, satisfies the policy
+
+    Overall status is NON_COMPLIANT if anything failed,
+    REVIEW_REQUIRED if nothing failed but something is unknown (the
+    framework cannot claim compliance for a control it could not
+    observe), otherwise COMPLIANT.
     """
-    violations = sort_by_severity(
-        evaluation_results["violations"]
+    fail = sort_by_severity(evaluation_results["fail"])
+    unknown = sort_by_severity(evaluation_results["unknown"])
+    not_applicable = sort_by_severity(evaluation_results["not_applicable"])
+    passed = evaluation_results["pass"]
+
+    infrastructure_file = evaluation_results["infrastructure_file"]
+    resource_count = load_infrastructure_resource_count(infrastructure_file)
+
+    fail_severity_counts = Counter(
+        item.get("severity", "Unknown") for item in fail
     )
 
-    manual_reviews = sort_by_severity(
-        evaluation_results["manual_reviews"]
-    )
-
-    infrastructure_file = evaluation_results[
-        "infrastructure_file"
-    ]
-
-    resource_count = load_infrastructure_resource_count(
-        infrastructure_file
-    )
-
-    severity_counts = Counter(
-        violation.get("severity", "Unknown")
-        for violation in violations
-    )
-
-    manual_severity_counts = Counter(
-        review.get("severity", "Unknown")
-        for review in manual_reviews
+    unknown_severity_counts = Counter(
+        item.get("severity", "Unknown") for item in unknown
     )
 
     affected_resources = sorted(
         {
-            violation.get("resource_id")
-            for violation in violations
-            if violation.get("resource_id")
+            item.get("resource_id")
+            for item in fail
+            if item.get("resource_id")
         }
     )
 
-    enriched_violations: list[dict[str, Any]] = []
+    enriched_fail: list[dict[str, Any]] = []
 
-    for violation in violations:
-        enriched = dict(violation)
+    for item in fail:
+        enriched = dict(item)
+        enriched["recommendation"] = build_recommendation(item)
+        enriched_fail.append(enriched)
 
-        enriched["recommendation"] = build_recommendation(
-            violation
-        )
-
-        enriched_violations.append(enriched)
-
-    if violations:
+    if fail:
         overall_status = "NON_COMPLIANT"
-
-    elif manual_reviews:
-        overall_status = "MANUAL_REVIEW_REQUIRED"
-
+    elif unknown:
+        overall_status = "REVIEW_REQUIRED"
     else:
         overall_status = "COMPLIANT"
 
     return {
         "report_metadata": {
-            "generated_at": datetime.now(
-                timezone.utc
-            ).isoformat(),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
             "infrastructure_file": infrastructure_file,
             "rego_file": evaluation_results["rego_file"],
             "report_type": (
@@ -302,53 +281,53 @@ def build_report_data(
         "summary": {
             "overall_status": overall_status,
             "resources_analysed": resource_count,
-            "technical_violation_count": len(violations),
-            "manual_review_count": len(manual_reviews),
-            "affected_resource_count": len(
-                affected_resources
-            ),
+            "fail_count": len(fail),
+            "unknown_count": len(unknown),
+            "not_applicable_count": len(not_applicable),
+            "pass_count": len(passed),
+            "affected_resource_count": len(affected_resources),
             "affected_resources": affected_resources,
-            "violations_by_severity": dict(
+            "fail_by_severity": dict(
                 sorted(
-                    severity_counts.items(),
-                    key=lambda item: (
-                        -SEVERITY_ORDER.get(
-                            item[0],
-                            0,
-                        )
-                    ),
+                    fail_severity_counts.items(),
+                    key=lambda item: -SEVERITY_ORDER.get(item[0], 0),
                 )
             ),
-            "manual_reviews_by_severity": dict(
+            "unknown_by_severity": dict(
                 sorted(
-                    manual_severity_counts.items(),
-                    key=lambda item: (
-                        -SEVERITY_ORDER.get(
-                            item[0],
-                            0,
-                        )
-                    ),
+                    unknown_severity_counts.items(),
+                    key=lambda item: -SEVERITY_ORDER.get(item[0], 0),
                 )
             ),
         },
-        "technical_violations": enriched_violations,
-        "manual_reviews": manual_reviews,
+        "fail": enriched_fail,
+        "unknown": unknown,
+        "not_applicable": not_applicable,
+        "pass_count": len(passed),
         "limitations": [
             (
-                "This report assesses selected GDPR-inspired "
-                "technical controls and does not establish complete "
-                "legal GDPR compliance."
+                "This report checks specific technical controls based "
+                "on GDPR requirements. Passing these controls is "
+                "evidence towards compliance, but it does not prove "
+                "full legal GDPR compliance on its own."
             ),
             (
-                "Policies marked for manual review require legal, "
-                "organisational or contextual evidence that cannot "
-                "be confirmed from infrastructure configuration "
-                "alone."
+                "The policy set only covers requirements that can "
+                "actually be checked from the infrastructure config. "
+                "Things that need legal, organisational or business "
+                "judgement (for example purpose limitation or "
+                "processor contracts) are out of scope for automatic "
+                "checking."
             ),
             (
-                "A missing control is treated as non-compliant "
-                "because the framework cannot assume that an absent "
-                "security setting is enabled."
+                "If a control can't be worked out from the "
+                "infrastructure, it's marked UNKNOWN - never assumed "
+                "to be compliant or non-compliant."
+            ),
+            (
+                "NOT_APPLICABLE means the policy doesn't apply to this "
+                "resource (for example, a conditional requirement "
+                "whose trigger wasn't met)."
             ),
         ],
     }
@@ -430,7 +409,7 @@ def status_class(status: str) -> str:
     """
     classes = {
         "NON_COMPLIANT": "overall-non-compliant",
-        "MANUAL_REVIEW_REQUIRED": "overall-manual",
+        "REVIEW_REQUIRED": "overall-manual",
         "COMPLIANT": "overall-compliant",
     }
 
@@ -448,8 +427,9 @@ def build_text_report(
     """
     metadata = report_data["report_metadata"]
     summary = report_data["summary"]
-    violations = report_data["technical_violations"]
-    manual_reviews = report_data["manual_reviews"]
+    fail = report_data["fail"]
+    unknown = report_data["unknown"]
+    not_applicable = report_data["not_applicable"]
 
     lines: list[str] = []
 
@@ -471,165 +451,122 @@ def build_text_report(
             "-" * 72,
             "",
             f"Overall status: {summary['overall_status']}",
-            (
-                "Resources analysed: "
-                f"{summary['resources_analysed']}"
-            ),
-            (
-                "Technical violations: "
-                f"{summary['technical_violation_count']}"
-            ),
-            (
-                "Manual reviews required: "
-                f"{summary['manual_review_count']}"
-            ),
-            (
-                "Affected resources: "
-                f"{summary['affected_resource_count']}"
-            ),
+            f"Resources analysed: {summary['resources_analysed']}",
+            f"Fail: {summary['fail_count']}",
+            f"Unknown: {summary['unknown_count']}",
+            f"Not applicable: {summary['not_applicable_count']}",
+            f"Pass: {summary['pass_count']}",
+            f"Affected resources: {summary['affected_resource_count']}",
             "",
         ]
     )
 
-    if violations:
+    if fail:
         lines.extend(
             [
                 "-" * 72,
-                "TECHNICAL VIOLATIONS",
+                "FAIL",
                 "-" * 72,
                 "",
             ]
         )
 
-        for number, violation in enumerate(
-            violations,
-            start=1,
-        ):
+        for number, item in enumerate(fail, start=1):
             lines.extend(
                 [
                     (
                         f"{number}. "
-                        f"[{violation.get('severity', 'Unknown')}] "
-                        f"{violation.get('title', 'Unknown policy')}"
+                        f"[{item.get('severity', 'Unknown')}] "
+                        f"{item.get('title', 'Unknown policy')}"
                     ),
                     "",
-                    (
-                        "   Policy ID: "
-                        f"{violation.get('policy_id', 'Unknown')}"
-                    ),
-                    (
-                        "   Reference: "
-                        f"{violation.get('reference', 'Unknown')}"
-                    ),
-                    (
-                        "   Resource: "
-                        f"{violation.get('resource_id', 'Unknown')}"
-                    ),
-                    (
-                        "   Provider: "
-                        f"{violation.get('provider', 'Unknown')}"
-                    ),
-                    (
-                        "   Original type: "
-                        f"{violation.get('original_type', 'Unknown')}"
-                    ),
-                    (
-                        "   Resource type: "
-                        f"{violation.get('resource_type', 'Unknown')}"
-                    ),
-                    (
-                        "   Control: "
-                        f"{violation.get('control', 'Unknown')}"
-                    ),
-                    (
-                        "   Expected: "
-                        f"{format_value(violation.get('expected_value'))}"
-                    ),
-                    (
-                        "   Actual: "
-                        f"{format_value(violation.get('actual_value'))}"
-                    ),
-                    (
-                        "   Finding: "
-                        f"{violation.get('message', 'No message')}"
-                    ),
-                    (
-                        "   Recommendation: "
-                        f"{violation.get('recommendation', '')}"
-                    ),
+                    f"   Policy ID: {item.get('policy_id', 'Unknown')}",
+                    f"   Reference: {item.get('reference', 'Unknown')}",
+                    f"   Resource: {item.get('resource_id', 'Unknown')}",
+                    f"   Provider: {item.get('provider', 'Unknown')}",
+                    f"   Original type: {item.get('original_type', 'Unknown')}",
+                    f"   Resource type: {item.get('resource_type', 'Unknown')}",
+                    f"   Control: {item.get('control', 'Unknown')}",
+                    f"   Expected: {format_value(item.get('expected_value'))}",
+                    f"   Actual: {format_value(item.get('actual_value'))}",
+                    f"   Finding: {item.get('message', 'No message')}",
+                    f"   Recommendation: {item.get('recommendation', '')}",
                     "",
                     "   Verification notes:",
-                    (
-                        "   "
-                        f"{violation.get('verification_notes', '')}"
-                    ),
+                    f"   {item.get('verification_notes', '')}",
                     "",
                     "." * 72,
                     "",
                 ]
             )
-
     else:
         lines.extend(
             [
                 "-" * 72,
-                "TECHNICAL VIOLATIONS",
+                "FAIL",
                 "-" * 72,
                 "",
-                "No technical policy violations were found.",
+                "No policies failed.",
                 "",
             ]
         )
 
-    if manual_reviews:
+    if unknown:
         lines.extend(
             [
                 "-" * 72,
-                "MANUAL REVIEWS REQUIRED",
+                "UNKNOWN",
                 "-" * 72,
                 "",
             ]
         )
 
-        for number, review in enumerate(
-            manual_reviews,
-            start=1,
-        ):
+        for number, item in enumerate(unknown, start=1):
             lines.extend(
                 [
                     (
                         f"{number}. "
-                        f"[{review.get('severity', 'Unknown')}] "
-                        f"{review.get('title', 'Unknown policy')}"
+                        f"[{item.get('severity', 'Unknown')}] "
+                        f"{item.get('title', 'Unknown policy')}"
                     ),
-                    "",
+                    f"   Resource: {item.get('resource_id', 'Unknown')}",
+                    f"   Control: {item.get('control', 'Unknown')}",
                     (
-                        "   Policy ID: "
-                        f"{review.get('policy_id', 'Unknown')}"
+                        "   Why it's unknown: the infrastructure did not "
+                        "provide evidence for this control."
                     ),
-                    (
-                        "   Reference: "
-                        f"{review.get('reference', 'Unknown')}"
-                    ),
-                    (
-                        "   Requirement: "
-                        f"{review.get('description', '')}"
-                    ),
-                    (
-                        "   Review action: "
-                        f"{review.get('message', '')}"
-                    ),
-                    "",
-                    "   Why manual review is required:",
-                    (
-                        "   "
-                        f"{review.get('verification_notes', '')}"
-                    ),
-                    "",
-                    "." * 72,
                     "",
                 ]
             )
+    else:
+        lines.extend(
+            [
+                "-" * 72,
+                "UNKNOWN",
+                "-" * 72,
+                "",
+                "No unknown results.",
+                "",
+            ]
+        )
+
+    if not_applicable:
+        lines.extend(
+            [
+                "-" * 72,
+                "NOT APPLICABLE",
+                "-" * 72,
+                "",
+            ]
+        )
+
+        for item in not_applicable:
+            lines.append(
+                f"- {item.get('resource_id', 'Unknown')}: "
+                f"{item.get('title', 'Unknown policy')}"
+            )
+
+        lines.append("")
 
     lines.extend(
         [
@@ -676,30 +613,27 @@ def save_text_report(
     return output_path
 
 
-def build_violation_cards(
-    violations: list[dict[str, Any]],
+def build_fail_cards(
+    fail: list[dict[str, Any]],
 ) -> str:
     """
-    Build HTML cards for technical violations.
+    Build HTML cards for failing policies.
     """
-    if not violations:
+    if not fail:
         return """
         <div class="empty-state success-state">
-            <h3>No technical violations found</h3>
+            <h3>No policies failed</h3>
             <p>
                 The evaluated infrastructure did not produce any
-                executable policy violations.
+                policy failures.
             </p>
         </div>
         """
 
     cards: list[str] = []
 
-    for violation in violations:
-        severity = violation.get(
-            "severity",
-            "Unknown",
-        )
+    for item in fail:
+        severity = item.get("severity", "Unknown")
 
         cards.append(
             f"""
@@ -711,163 +645,73 @@ def build_violation_cards(
                         </span>
 
                         <h3>
-                            {escape_html(
-                                violation.get(
-                                    "title",
-                                    "Unknown policy",
-                                )
-                            )}
+                            {escape_html(item.get("title", "Unknown policy"))}
                         </h3>
                     </div>
 
-                    <span class="status non-compliant">
-                        Non-compliant
-                    </span>
+                    <span class="status non-compliant">Fail</span>
                 </div>
 
                 <div class="finding-grid">
                     <div>
                         <span class="label">Policy ID</span>
-                        <span class="value">
-                            {escape_html(
-                                violation.get(
-                                    "policy_id",
-                                    "Unknown",
-                                )
-                            )}
-                        </span>
+                        <span class="value">{escape_html(item.get("policy_id", "Unknown"))}</span>
                     </div>
 
                     <div>
                         <span class="label">GDPR reference</span>
-                        <span class="value">
-                            {escape_html(
-                                violation.get(
-                                    "reference",
-                                    "Unknown",
-                                )
-                            )}
-                        </span>
+                        <span class="value">{escape_html(item.get("reference", "Unknown"))}</span>
                     </div>
 
                     <div>
                         <span class="label">Resource</span>
-                        <span class="value">
-                            {escape_html(
-                                violation.get(
-                                    "resource_id",
-                                    "Unknown",
-                                )
-                            )}
-                        </span>
+                        <span class="value">{escape_html(item.get("resource_id", "Unknown"))}</span>
                     </div>
 
                     <div>
                         <span class="label">Provider</span>
-                        <span class="value">
-                            {escape_html(
-                                violation.get(
-                                    "provider",
-                                    "Unknown",
-                                )
-                            )}
-                        </span>
+                        <span class="value">{escape_html(item.get("provider", "Unknown"))}</span>
                     </div>
 
                     <div>
                         <span class="label">Terraform type</span>
-                        <span class="value">
-                            {escape_html(
-                                violation.get(
-                                    "original_type",
-                                    "Unknown",
-                                )
-                            )}
-                        </span>
+                        <span class="value">{escape_html(item.get("original_type", "Unknown"))}</span>
                     </div>
 
                     <div>
-                        <span class="label">
-                            Generic resource type
-                        </span>
-                        <span class="value">
-                            {escape_html(
-                                violation.get(
-                                    "resource_type",
-                                    "Unknown",
-                                )
-                            )}
-                        </span>
+                        <span class="label">Generic resource type</span>
+                        <span class="value">{escape_html(item.get("resource_type", "Unknown"))}</span>
                     </div>
 
                     <div>
                         <span class="label">Control</span>
-                        <span class="value">
-                            {escape_html(
-                                violation.get(
-                                    "control",
-                                    "Unknown",
-                                )
-                            )}
-                        </span>
+                        <span class="value">{escape_html(item.get("control", "Unknown"))}</span>
                     </div>
 
                     <div>
                         <span class="label">Expected value</span>
-                        <span class="value">
-                            {escape_html(
-                                violation.get("expected_value")
-                            )}
-                        </span>
+                        <span class="value">{escape_html(item.get("expected_value"))}</span>
                     </div>
 
                     <div>
                         <span class="label">Actual value</span>
-                        <span class="value">
-                            {escape_html(
-                                violation.get("actual_value")
-                            )}
-                        </span>
+                        <span class="value">{escape_html(item.get("actual_value"))}</span>
                     </div>
                 </div>
 
                 <div class="message-box">
                     <strong>Finding</strong>
-                    <p>
-                        {escape_html(
-                            violation.get(
-                                "message",
-                                "No message available.",
-                            )
-                        )}
-                    </p>
+                    <p>{escape_html(item.get("message", "No message available."))}</p>
                 </div>
 
                 <div class="recommendation-box">
                     <strong>Recommendation</strong>
-                    <p>
-                        {escape_html(
-                            violation.get(
-                                "recommendation",
-                                "Review the infrastructure configuration.",
-                            )
-                        )}
-                    </p>
+                    <p>{escape_html(item.get("recommendation", "Review the infrastructure configuration."))}</p>
                 </div>
 
                 <details>
-                    <summary>
-                        How the framework checked this policy
-                    </summary>
-
-                    <p>
-                        {escape_html(
-                            violation.get(
-                                "verification_notes",
-                                "No verification notes available.",
-                            )
-                        )}
-                    </p>
+                    <summary>How the framework checked this policy</summary>
+                    <p>{escape_html(item.get("verification_notes", "No verification notes available."))}</p>
                 </details>
             </article>
             """
@@ -876,30 +720,28 @@ def build_violation_cards(
     return "\n".join(cards)
 
 
-def build_manual_review_cards(
-    manual_reviews: list[dict[str, Any]],
+def build_unknown_cards(
+    unknown: list[dict[str, Any]],
 ) -> str:
     """
-    Build HTML cards for manual-review policies.
+    Build HTML cards for policies whose controls could not be
+    determined.
     """
-    if not manual_reviews:
+    if not unknown:
         return """
         <div class="empty-state">
-            <h3>No manual reviews required</h3>
+            <h3>No unknown results</h3>
             <p>
-                All included policies were suitable for automated
-                infrastructure evaluation.
+                Every applicable policy could be resolved to pass or
+                fail from the available infrastructure evidence.
             </p>
         </div>
         """
 
     cards: list[str] = []
 
-    for review in manual_reviews:
-        severity = review.get(
-            "severity",
-            "Unknown",
-        )
+    for item in unknown:
+        severity = item.get("severity", "Unknown")
 
         cards.append(
             f"""
@@ -910,114 +752,74 @@ def build_manual_review_cards(
                             {escape_html(severity)}
                         </span>
 
-                        <h3>
-                            {escape_html(
-                                review.get(
-                                    "title",
-                                    "Unknown policy",
-                                )
-                            )}
-                        </h3>
+                        <h3>{escape_html(item.get("title", "Unknown policy"))}</h3>
                     </div>
 
-                    <span class="status manual">
-                        Manual review
-                    </span>
+                    <span class="status manual">Unknown</span>
                 </div>
 
                 <div class="finding-grid">
                     <div>
                         <span class="label">Policy ID</span>
-                        <span class="value">
-                            {escape_html(
-                                review.get(
-                                    "policy_id",
-                                    "Unknown",
-                                )
-                            )}
-                        </span>
+                        <span class="value">{escape_html(item.get("policy_id", "Unknown"))}</span>
                     </div>
 
                     <div>
                         <span class="label">GDPR reference</span>
-                        <span class="value">
-                            {escape_html(
-                                review.get(
-                                    "reference",
-                                    "Unknown",
-                                )
-                            )}
-                        </span>
+                        <span class="value">{escape_html(item.get("reference", "Unknown"))}</span>
+                    </div>
+
+                    <div>
+                        <span class="label">Resource</span>
+                        <span class="value">{escape_html(item.get("resource_id", "Unknown"))}</span>
                     </div>
 
                     <div>
                         <span class="label">Control</span>
-                        <span class="value">
-                            {escape_html(
-                                review.get(
-                                    "control",
-                                    "Unknown",
-                                )
-                            )}
-                        </span>
+                        <span class="value">{escape_html(item.get("control", "Unknown"))}</span>
                     </div>
-
-                    <div>
-                        <span class="label">Resource type</span>
-                        <span class="value">
-                            {escape_html(
-                                review.get(
-                                    "resource_type",
-                                    "Unknown",
-                                )
-                            )}
-                        </span>
-                    </div>
-                </div>
-
-                <div class="requirement-box">
-                    <strong>Requirement</strong>
-                    <p>
-                        {escape_html(
-                            review.get(
-                                "description",
-                                "No description available.",
-                            )
-                        )}
-                    </p>
                 </div>
 
                 <div class="manual-box">
-                    <strong>Review action</strong>
+                    <strong>Why this is unknown</strong>
                     <p>
-                        {escape_html(
-                            review.get(
-                                "message",
-                                "Manual review is required.",
-                            )
-                        )}
+                        {escape_html(item.get("message", "The infrastructure did not provide evidence for this control."))}
                     </p>
                 </div>
 
                 <details>
-                    <summary>
-                        Why this cannot be fully automated
-                    </summary>
-
-                    <p>
-                        {escape_html(
-                            review.get(
-                                "verification_notes",
-                                "No verification notes available.",
-                            )
-                        )}
-                    </p>
+                    <summary>How the framework checks this policy</summary>
+                    <p>{escape_html(item.get("verification_notes", "No verification notes available."))}</p>
                 </details>
             </article>
             """
         )
 
     return "\n".join(cards)
+
+
+def build_not_applicable_list(
+    not_applicable: list[dict[str, Any]],
+) -> str:
+    """
+    Build a compact list for not-applicable results -- these are not
+    findings that need attention, so they get a list, not full detail
+    cards.
+    """
+    if not not_applicable:
+        return "<p>No not-applicable results.</p>"
+
+    items = "\n".join(
+        (
+            "<li>"
+            f"<strong>{escape_html(item.get('resource_id', 'Unknown'))}</strong>"
+            f" &mdash; {escape_html(item.get('title', 'Unknown policy'))}"
+            "</li>"
+        )
+        for item in not_applicable
+    )
+
+    return f"<ul class='not-applicable-list'>{items}</ul>"
 
 
 def build_html_report(
@@ -1028,38 +830,29 @@ def build_html_report(
     """
     metadata = report_data["report_metadata"]
     summary = report_data["summary"]
-    violations = report_data["technical_violations"]
-    manual_reviews = report_data["manual_reviews"]
+    fail = report_data["fail"]
+    unknown = report_data["unknown"]
+    not_applicable = report_data["not_applicable"]
     limitations = report_data["limitations"]
 
     overall_status = summary["overall_status"]
 
-    affected_resources = summary.get(
-        "affected_resources",
-        [],
-    )
+    affected_resources = summary.get("affected_resources", [])
 
     if affected_resources:
         affected_resource_text = ", ".join(
-            escape_html(resource)
-            for resource in affected_resources
+            escape_html(resource) for resource in affected_resources
         )
-
     else:
         affected_resource_text = "None"
 
     limitation_items = "\n".join(
-        f"<li>{escape_html(item)}</li>"
-        for item in limitations
+        f"<li>{escape_html(item)}</li>" for item in limitations
     )
 
-    violation_cards = build_violation_cards(
-        violations
-    )
-
-    manual_cards = build_manual_review_cards(
-        manual_reviews
-    )
+    fail_cards = build_fail_cards(fail)
+    unknown_cards = build_unknown_cards(unknown)
+    not_applicable_list = build_not_applicable_list(not_applicable)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1416,6 +1209,18 @@ def build_html_report(
             border-left: 5px solid var(--low-text);
         }}
 
+        .not-applicable-list {{
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px 20px 20px 40px;
+            margin: 0;
+        }}
+
+        .not-applicable-list li + li {{
+            margin-top: 8px;
+        }}
+
         footer {{
             color: var(--muted);
             font-size: 13px;
@@ -1467,43 +1272,28 @@ def build_html_report(
     <main class="container">
         <div class="metrics">
             <div class="metric">
-                <span class="metric-label">
-                    Resources analysed
-                </span>
-
-                <span class="metric-value">
-                    {summary["resources_analysed"]}
-                </span>
+                <span class="metric-label">Resources analysed</span>
+                <span class="metric-value">{summary["resources_analysed"]}</span>
             </div>
 
             <div class="metric">
-                <span class="metric-label">
-                    Technical violations
-                </span>
-
-                <span class="metric-value">
-                    {summary["technical_violation_count"]}
-                </span>
+                <span class="metric-label">Fail</span>
+                <span class="metric-value">{summary["fail_count"]}</span>
             </div>
 
             <div class="metric">
-                <span class="metric-label">
-                    Manual reviews
-                </span>
-
-                <span class="metric-value">
-                    {summary["manual_review_count"]}
-                </span>
+                <span class="metric-label">Unknown</span>
+                <span class="metric-value">{summary["unknown_count"]}</span>
             </div>
 
             <div class="metric">
-                <span class="metric-label">
-                    Affected resources
-                </span>
+                <span class="metric-label">Not applicable</span>
+                <span class="metric-value">{summary["not_applicable_count"]}</span>
+            </div>
 
-                <span class="metric-value">
-                    {summary["affected_resource_count"]}
-                </span>
+            <div class="metric">
+                <span class="metric-label">Pass</span>
+                <span class="metric-value">{summary["pass_count"]}</span>
             </div>
         </div>
 
@@ -1513,25 +1303,13 @@ def build_html_report(
             <div class="information-panel">
                 <dl>
                     <dt>Generated</dt>
-                    <dd>
-                        {escape_html(
-                            metadata["generated_at"]
-                        )}
-                    </dd>
+                    <dd>{escape_html(metadata["generated_at"])}</dd>
 
                     <dt>Infrastructure file</dt>
-                    <dd>
-                        {escape_html(
-                            metadata["infrastructure_file"]
-                        )}
-                    </dd>
+                    <dd>{escape_html(metadata["infrastructure_file"])}</dd>
 
                     <dt>Generated Rego file</dt>
-                    <dd>
-                        {escape_html(
-                            metadata["rego_file"]
-                        )}
-                    </dd>
+                    <dd>{escape_html(metadata["rego_file"])}</dd>
 
                     <dt>Affected resources</dt>
                     <dd>{affected_resource_text}</dd>
@@ -1540,13 +1318,18 @@ def build_html_report(
         </section>
 
         <section>
-            <h2>Technical violations</h2>
-            {violation_cards}
+            <h2>Fail</h2>
+            {fail_cards}
         </section>
 
         <section>
-            <h2>Manual reviews required</h2>
-            {manual_cards}
+            <h2>Unknown</h2>
+            {unknown_cards}
+        </section>
+
+        <section>
+            <h2>Not applicable</h2>
+            {not_applicable_list}
         </section>
 
         <section>
@@ -1620,47 +1403,20 @@ def generate_reports(
     """
     Generate JSON, text and browser-based HTML reports.
     """
-    evaluation_results = load_evaluation_results(
-        evaluation_path
-    )
+    evaluation_results = load_evaluation_results(evaluation_path)
 
-    report_data = build_report_data(
-        evaluation_results
-    )
+    report_data = build_report_data(evaluation_results)
 
-    json_path = save_json_report(
-        report_data,
-        json_output_path,
-    )
+    json_path = save_json_report(report_data, json_output_path)
+    text_path = save_text_report(report_data, text_output_path)
+    html_path = save_html_report(report_data, html_output_path)
 
-    text_path = save_text_report(
-        report_data,
-        text_output_path,
-    )
-
-    html_path = save_html_report(
-        report_data,
-        html_output_path,
-    )
-
-    print(
-        "\nCompliance report generation successful."
-    )
-
-    print(
-        "Overall status: "
-        f"{report_data['summary']['overall_status']}"
-    )
-
-    print(
-        "Technical violations: "
-        f"{report_data['summary']['technical_violation_count']}"
-    )
-
-    print(
-        "Manual reviews: "
-        f"{report_data['summary']['manual_review_count']}"
-    )
+    print("\nCompliance report generation successful.")
+    print(f"Overall status: {report_data['summary']['overall_status']}")
+    print(f"Fail: {report_data['summary']['fail_count']}")
+    print(f"Unknown: {report_data['summary']['unknown_count']}")
+    print(f"Not applicable: {report_data['summary']['not_applicable_count']}")
+    print(f"Pass: {report_data['summary']['pass_count']}")
 
     print(f"JSON report: {json_path}")
     print(f"Text report: {text_path}")
@@ -1668,10 +1424,7 @@ def generate_reports(
 
     if open_browser:
         open_html_report(html_path)
-
-        print(
-            "The HTML report was sent to your default browser."
-        )
+        print("The HTML report was sent to your default browser.")
 
     return {
         "json_report": json_path,

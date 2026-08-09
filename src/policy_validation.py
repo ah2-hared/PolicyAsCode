@@ -88,16 +88,16 @@ def validate_policy_file(
     print(f"Schema used: {schema_path}")
     print(f"Number of policies: {len(policies)}")
 
-    counts = {"full": 0, "partial": 0, "manual": 0}
+    resource_type_counts: dict[str, int] = {}
     for policy in policies:
-        level = policy.get("automation_level")
-        if level in counts:
-            counts[level] += 1
+        resource_type = policy.get("resource_type", "unknown")
+        resource_type_counts[resource_type] = (
+            resource_type_counts.get(resource_type, 0) + 1
+        )
 
-    print("\nAutomation levels:")
-    print(f"Fully automated: {counts['full']}")
-    print(f"Partially automated: {counts['partial']}")
-    print(f"Manual review: {counts['manual']}")
+    print("\nPolicies by resource type:")
+    for resource_type, count in sorted(resource_type_counts.items()):
+        print(f"{resource_type}: {count}")
     return True
 
 if __name__ == "__main__":

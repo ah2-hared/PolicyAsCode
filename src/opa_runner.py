@@ -29,9 +29,8 @@ def run_opa_query(
     """
     Run one OPA query and return its result as Python data.
 
-    Examples of queries:
-        data.gdpr.deny
-        data.gdpr.manual_reviews
+    Example query:
+        data.gdpr.all_results
     """
     if not opa_path.exists():
         raise FileNotFoundError(
@@ -182,6 +181,30 @@ def check_rego_syntax(
     return True
 
 
+def partition_by_status(
+    results: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    Split a flat result list into the four status buckets. Any status
+    that is not one of the four defined values is still kept (under
+    its own key) rather than dropped, so a bug in Rego generation
+    shows up as a visible, unexpected bucket instead of silently
+    disappearing.
+    """
+    buckets: dict[str, list[dict[str, Any]]] = {
+        "fail": [],
+        "unknown": [],
+        "not_applicable": [],
+        "pass": [],
+    }
+
+    for result in results:
+        status = result.get("status", "unknown")
+        buckets.setdefault(status, []).append(result)
+
+    return buckets
+
+
 def evaluate_infrastructure(
     infrastructure_path: Path = DEFAULT_INFRASTRUCTURE_PATH,
     rego_path: Path = DEFAULT_REGO_PATH,
@@ -196,9 +219,9 @@ def evaluate_infrastructure(
     Steps:
         1. Validate the normalised infrastructure.
         2. Check the generated Rego syntax.
-        3. Retrieve technical policy violations.
-        4. Retrieve manual-review policies.
-        5. Return the results as Python data.
+        3. Retrieve every policy result (pass/fail/unknown/
+           not_applicable) in one query.
+        4. Partition and return the results as Python data.
     """
     print("\nStarting infrastructure evaluation.")
 
@@ -222,32 +245,33 @@ def evaluate_infrastructure(
             "Rego file is invalid."
         )
 
-    violations = run_opa_query(
-        query="data.gdpr.deny",
+    all_results = run_opa_query(
+        query="data.gdpr.all_results",
         infrastructure_path=infrastructure_path,
         rego_path=rego_path,
         opa_path=opa_path,
     )
 
-    manual_reviews = run_opa_query(
-        query="data.gdpr.manual_reviews",
-        infrastructure_path=infrastructure_path,
-        rego_path=rego_path,
-        opa_path=opa_path,
-    )
+    buckets = partition_by_status(all_results)
 
     result = {
         "infrastructure_file": str(infrastructure_path),
         "rego_file": str(rego_path),
-        "violation_count": len(violations),
-        "manual_review_count": len(manual_reviews),
-        "violations": violations,
-        "manual_reviews": manual_reviews,
+        "fail_count": len(buckets["fail"]),
+        "unknown_count": len(buckets["unknown"]),
+        "not_applicable_count": len(buckets["not_applicable"]),
+        "pass_count": len(buckets["pass"]),
+        "fail": buckets["fail"],
+        "unknown": buckets["unknown"],
+        "not_applicable": buckets["not_applicable"],
+        "pass": buckets["pass"],
     }
 
     print("\nOPA evaluation successful.")
-    print(f"Technical violations: {len(violations)}")
-    print(f"Manual reviews required: {len(manual_reviews)}")
+    print(f"Fail: {len(buckets['fail'])}")
+    print(f"Unknown: {len(buckets['unknown'])}")
+    print(f"Not applicable: {len(buckets['not_applicable'])}")
+    print(f"Pass: {len(buckets['pass'])}")
 
     return result
 
@@ -293,29 +317,40 @@ if __name__ == "__main__":
             output_path=raw_output_path,
         )
 
-        print("\nViolation summary:")
+        print("\nFail summary:")
 
-        if evaluation_results["violations"]:
-            for violation in evaluation_results["violations"]:
+        if evaluation_results["fail"]:
+            for item in evaluation_results["fail"]:
                 print(
-                    f"- [{violation['severity']}] "
-                    f"{violation['resource_id']}: "
-                    f"{violation['message']}"
+                    f"- [{item['severity']}] "
+                    f"{item['resource_id']}: "
+                    f"{item['message']}"
                 )
         else:
-            print("- No technical violations found.")
+            print("- No failing policies.")
 
-        print("\nManual-review summary:")
+        print("\nUnknown summary:")
 
-        if evaluation_results["manual_reviews"]:
-            for review in evaluation_results["manual_reviews"]:
+        if evaluation_results["unknown"]:
+            for item in evaluation_results["unknown"]:
                 print(
-                    f"- [{review['severity']}] "
-                    f"{review['title']}: "
-                    f"{review['message']}"
+                    f"- [{item['severity']}] "
+                    f"{item['resource_id']}: "
+                    f"{item['control']} could not be determined."
                 )
         else:
-            print("- No manual reviews required.")
+            print("- No unknown results.")
+
+        print("\nNot-applicable summary:")
+
+        if evaluation_results["not_applicable"]:
+            for item in evaluation_results["not_applicable"]:
+                print(
+                    f"- {item['resource_id']}: "
+                    f"{item['title']} does not apply."
+                )
+        else:
+            print("- No not-applicable results.")
 
     except (
         FileNotFoundError,

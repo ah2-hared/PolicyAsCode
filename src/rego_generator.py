@@ -23,10 +23,6 @@ EXECUTABLE_OPERATORS = {
     "required_if",
 }
 
-MANUAL_OPERATORS = {
-    "manual_review",
-}
-
 
 def to_rego_value(value: Any) -> str:
     """
@@ -91,13 +87,6 @@ def build_control_lookup(
 
     object.get prevents the rule from becoming undefined when a
     control is missing.
-
-    Example:
-        object.get(
-            resource.controls,
-            "encryption_enabled",
-            null
-        )
     """
     control = escape_rego_string(control_name)
     default = to_rego_value(default_value)
@@ -107,13 +96,35 @@ def build_control_lookup(
     )
 
 
-def build_violation_object(policy: Policy) -> str:
+def build_result_object(
+    policy: Policy,
+    status: str,
+    actual_value_expr: str,
+    control_expr: str | None = None,
+) -> str:
     """
-    Build the violation object returned by an executable rule.
+    Build one policy-evaluation result.
 
-    Resource details are included so the report can identify the
-    exact infrastructure resource that failed.
+    Every policy now resolves to exactly one of four statuses for each
+    resource it applies to:
+
+        pass            the control was observed and satisfies the
+                         policy
+        fail            the control was observed and violates the
+                         policy
+        unknown         the control could not be determined from the
+                         infrastructure -- never silently treated as
+                         pass or fail
+        not_applicable  the policy's underlying question does not
+                         apply to this resource (a required_if trigger
+                         that was not met)
+
+    control_expr lets composite rules (all_of) report which specific
+    control produced this result, since they check several at once;
+    it defaults to the policy's own declared control.
     """
+    control_field = control_expr or escape_rego_string(policy.control)
+
     return f"""{{
         "policy_id": {escape_rego_string(policy.id)},
         "policy_source": {escape_rego_string(policy.policy_source)},
@@ -122,74 +133,164 @@ def build_violation_object(policy: Policy) -> str:
         "message": {escape_rego_string(policy.message)},
         "severity": {escape_rego_string(policy.severity)},
         "cia_category": {escape_rego_string(policy.cia_category)},
-        "automation_level": {escape_rego_string(policy.automation_level)},
         "verification_notes": {escape_rego_string(policy.verification_notes)},
         "resource_id": resource.id,
         "provider": resource.provider,
         "original_type": resource.original_type,
         "resource_type": resource.resource_type,
-        "control": {escape_rego_string(policy.control)},
+        "control": {control_field},
         "operator": {escape_rego_string(policy.operator)},
         "expected_value": {to_rego_value(policy.expected_value)},
-        "actual_value": object.get(
-            resource.controls,
-            {escape_rego_string(policy.control)},
-            null
-        ),
-        "status": "non_compliant"
+        "actual_value": {actual_value_expr},
+        "status": {escape_rego_string(status)}
     }}"""
 
 
-def build_standard_violation_condition(policy: Policy) -> str:
+def build_operator_condition(
+    operator: str,
+    actual_var: str,
+    expected: str,
+    policy_id: str,
+) -> str:
     """
-    Build the Rego condition for a normal comparison policy.
+    The Rego condition that decides whether a *known* control value
+    violates the policy.
 
-    Missing controls use null as the actual value. This means a
-    required control that is absent will usually produce a violation.
+    Only ever evaluated once the caller has already proven actual_var
+    is not null, so numeric and membership comparisons never have to
+    compare against null here.
     """
-    actual = build_control_lookup(policy.control)
-    expected = to_rego_value(policy.expected_value)
-
     conditions = {
-        "equals": f"{actual} != {expected}",
-        "not_equals": f"{actual} == {expected}",
-        "greater_than": f"{actual} <= {expected}",
-        "greater_than_or_equal": f"{actual} < {expected}",
-        "less_than": f"{actual} >= {expected}",
-        "less_than_or_equal": f"{actual} > {expected}",
+        "equals": f"{actual_var} != {expected}",
+        "not_equals": f"{actual_var} == {expected}",
+        "greater_than": f"{actual_var} <= {expected}",
+        "greater_than_or_equal": f"{actual_var} < {expected}",
+        "less_than": f"{actual_var} >= {expected}",
+        "less_than_or_equal": f"{actual_var} > {expected}",
     }
 
-    if policy.operator in conditions:
-        return conditions[policy.operator]
+    if operator in conditions:
+        return conditions[operator]
 
-    if policy.operator == "contains":
-        return f"not {expected} in {actual}"
+    if operator == "contains":
+        return f"not {expected} in {actual_var}"
 
-    if policy.operator == "not_contains":
-        return f"{expected} in {actual}"
+    if operator == "not_contains":
+        return f"{expected} in {actual_var}"
 
     raise ValueError(
-        f"Unsupported standard operator '{policy.operator}' "
-        f"for policy '{policy.id}'."
+        f"Unsupported standard operator '{operator}' "
+        f"for policy '{policy_id}'."
+    )
+
+
+def build_pass_condition(
+    operator: str,
+    actual_var: str,
+    expected: str,
+    policy_id: str,
+) -> str:
+    """
+    The opposite of build_operator_condition: the condition for when a
+    known value passes the policy instead of failing it. Written out
+    separately instead of just wrapping the fail condition in Rego's
+    `not`, so it's easy to read the pass/fail pair side by side.
+    """
+    conditions = {
+        "equals": f"{actual_var} == {expected}",
+        "not_equals": f"{actual_var} != {expected}",
+        "greater_than": f"{actual_var} > {expected}",
+        "greater_than_or_equal": f"{actual_var} >= {expected}",
+        "less_than": f"{actual_var} < {expected}",
+        "less_than_or_equal": f"{actual_var} <= {expected}",
+    }
+
+    if operator in conditions:
+        return conditions[operator]
+
+    if operator == "contains":
+        return f"{expected} in {actual_var}"
+
+    if operator == "not_contains":
+        return f"not {expected} in {actual_var}"
+
+    raise ValueError(
+        f"Unsupported standard operator '{operator}' "
+        f"for policy '{policy_id}'."
     )
 
 
 def generate_standard_rule(policy: Policy) -> str:
     """
-    Generate a rule for equals, numerical comparisons, contains,
-    and not_contains.
+    Generate a rule for equals, numerical comparisons, contains, and
+    not_contains.
+
+    Every standard rule is four alternative bodies for the same rule
+    name, one per possible status:
+
+    1. not_applicable -- the control is missing AND the resource
+       explicitly marks it not applicable (see
+       resource.metadata.not_applicable_controls).
+    2. unknown -- the control is missing and nothing marks it
+       not-applicable. This is the framework's fail-closed default: an
+       unknown control is never assumed to be pass or fail.
+    3. fail -- the control is present and violates the policy.
+    4. pass -- the control is present and satisfies the policy.
     """
     rule_name = generate_rule_name(policy)
     resource_match = build_resource_match(policy)
-    condition = build_standard_violation_condition(policy)
-    violation_object = build_violation_object(policy)
+    control = escape_rego_string(policy.control)
+    expected = to_rego_value(policy.expected_value)
+
+    fail_condition = build_operator_condition(
+        policy.operator, "actual", expected, policy.id,
+    )
+    pass_condition = build_pass_condition(
+        policy.operator, "actual", expected, policy.id,
+    )
+
+    not_applicable_result = build_result_object(policy, "not_applicable", "null")
+    unknown_result = build_result_object(policy, "unknown", "null")
+    fail_result = build_result_object(policy, "fail", "actual")
+    pass_result = build_result_object(policy, "pass", "actual")
 
     return f"""# {policy.id}: {policy.title}
-{rule_name} contains violation if {{
+{rule_name} contains result if {{
     {resource_match}
-    {condition}
+    actual := object.get(resource.controls, {control}, null)
+    actual == null
+    not_applicable_controls := object.get(resource.metadata, "not_applicable_controls", [])
+    {control} in not_applicable_controls
 
-    violation := {violation_object}
+    result := {not_applicable_result}
+}}
+
+{rule_name} contains result if {{
+    {resource_match}
+    actual := object.get(resource.controls, {control}, null)
+    actual == null
+    not_applicable_controls := object.get(resource.metadata, "not_applicable_controls", [])
+    not {control} in not_applicable_controls
+
+    result := {unknown_result}
+}}
+
+{rule_name} contains result if {{
+    {resource_match}
+    actual := object.get(resource.controls, {control}, null)
+    actual != null
+    {fail_condition}
+
+    result := {fail_result}
+}}
+
+{rule_name} contains result if {{
+    {resource_match}
+    actual := object.get(resource.controls, {control}, null)
+    actual != null
+    {pass_condition}
+
+    result := {pass_result}
 }}
 """
 
@@ -199,15 +300,14 @@ def generate_all_of_rule(policy: Policy) -> str:
     Generate a composite rule.
 
     The policy's expected_value must contain a list of control names.
-    The rule produces a violation when any listed control is missing
-    or is not equal to true.
+    Gives one result per control that isn't confirmed true, so you can
+    see exactly which one is the problem, plus a single pass result
+    when every listed control is true. A resource can't get both a
+    pass and a fail for the same policy, since pass only fires when
+    every control is true.
 
     Example expected_value:
-        [
-            "encryption_enabled",
-            "logging_enabled",
-            "backup_enabled"
-        ]
+        ["encryption_enabled", "access_control_enabled", "backup_enabled"]
     """
     if not isinstance(policy.expected_value, list):
         raise ValueError(
@@ -219,44 +319,42 @@ def generate_all_of_rule(policy: Policy) -> str:
     resource_match = build_resource_match(policy)
     expected_controls = to_rego_value(policy.expected_value)
 
-    violation_object = f"""{{
-        "policy_id": {escape_rego_string(policy.id)},
-        "policy_source": {escape_rego_string(policy.policy_source)},
-        "reference": {escape_rego_string(policy.reference)},
-        "title": {escape_rego_string(policy.title)},
-        "message": {escape_rego_string(policy.message)},
-        "severity": {escape_rego_string(policy.severity)},
-        "cia_category": {escape_rego_string(policy.cia_category)},
-        "automation_level": {escape_rego_string(policy.automation_level)},
-        "verification_notes": {escape_rego_string(policy.verification_notes)},
-        "resource_id": resource.id,
-        "provider": resource.provider,
-        "original_type": resource.original_type,
-        "resource_type": resource.resource_type,
-        "control": {escape_rego_string(policy.control)},
-        "operator": "all_of",
-        "missing_or_disabled_control": expected_control,
-        "expected_value": true,
-        "actual_value": object.get(
-            resource.controls,
-            expected_control,
-            null
-        ),
-        "status": "non_compliant"
-    }}"""
+    fail_result = build_result_object(
+        policy, "fail", "actual", control_expr="expected_control",
+    )
+    unknown_result = build_result_object(
+        policy, "unknown", "null", control_expr="expected_control",
+    )
+    pass_result = build_result_object(
+        policy, "pass", "true", control_expr=escape_rego_string(policy.control),
+    )
 
     return f"""# {policy.id}: {policy.title}
-{rule_name} contains violation if {{
+{rule_name} contains result if {{
     {resource_match}
     some expected_control in {expected_controls}
+    actual := object.get(resource.controls, expected_control, null)
+    actual == false
 
-    object.get(
-        resource.controls,
-        expected_control,
-        null
-    ) != true
+    result := {fail_result}
+}}
 
-    violation := {violation_object}
+{rule_name} contains result if {{
+    {resource_match}
+    some expected_control in {expected_controls}
+    actual := object.get(resource.controls, expected_control, null)
+    actual == null
+
+    result := {unknown_result}
+}}
+
+{rule_name} contains result if {{
+    {resource_match}
+    every expected_control in {expected_controls} {{
+        object.get(resource.controls, expected_control, null) == true
+    }}
+
+    result := {pass_result}
 }}
 """
 
@@ -319,10 +417,20 @@ def generate_required_if_rule(policy: Policy) -> str:
     """
     Generate a conditional rule.
 
-    A violation is returned when:
+    Five bodies cover every combination:
 
-    1. The trigger control has the trigger value.
-    2. The required control does not have the required value.
+    1. unknown       -- the trigger control itself could not be
+                         determined, so whether the requirement even
+                         applies is unknown.
+    2. not_applicable -- the trigger control is known and does not
+                         equal the trigger value: the requirement
+                         genuinely does not apply to this resource.
+    3. unknown       -- the trigger fired, but the required control
+                         could not be determined.
+    4. fail          -- the trigger fired and the required control is
+                         known but does not meet the required value.
+    5. pass          -- the trigger fired and the required control
+                         meets the required value.
     """
     config = validate_required_if_configuration(policy)
 
@@ -333,47 +441,64 @@ def generate_required_if_rule(policy: Policy) -> str:
     if_value = to_rego_value(config["if_value"])
 
     required_control = config["required_control"]
-    required_value = to_rego_value(
-        config["required_value"]
-    )
+    required_value = to_rego_value(config["required_value"])
 
     trigger_lookup = build_control_lookup(if_control)
     required_lookup = build_control_lookup(required_control)
 
-    violation_object = f"""{{
-        "policy_id": {escape_rego_string(policy.id)},
-        "policy_source": {escape_rego_string(policy.policy_source)},
-        "reference": {escape_rego_string(policy.reference)},
-        "title": {escape_rego_string(policy.title)},
-        "message": {escape_rego_string(policy.message)},
-        "severity": {escape_rego_string(policy.severity)},
-        "cia_category": {escape_rego_string(policy.cia_category)},
-        "automation_level": {escape_rego_string(policy.automation_level)},
-        "verification_notes": {escape_rego_string(policy.verification_notes)},
-        "resource_id": resource.id,
-        "provider": resource.provider,
-        "original_type": resource.original_type,
-        "resource_type": resource.resource_type,
-        "control": {escape_rego_string(required_control)},
-        "operator": "required_if",
-        "trigger_control": {escape_rego_string(if_control)},
-        "trigger_value": {to_rego_value(config["if_value"])},
-        "expected_value": {required_value},
-        "actual_value": object.get(
-            resource.controls,
-            {escape_rego_string(required_control)},
-            null
-        ),
-        "status": "non_compliant"
-    }}"""
+    unknown_trigger_result = build_result_object(policy, "unknown", "null")
+    not_applicable_result = build_result_object(policy, "not_applicable", "null")
+    unknown_required_result = build_result_object(policy, "unknown", "null")
+    fail_result = build_result_object(policy, "fail", "required")
+    pass_result = build_result_object(policy, "pass", "required")
 
     return f"""# {policy.id}: {policy.title}
-{rule_name} contains violation if {{
+{rule_name} contains result if {{
     {resource_match}
-    {trigger_lookup} == {if_value}
-    {required_lookup} != {required_value}
+    trigger := {trigger_lookup}
+    trigger == null
 
-    violation := {violation_object}
+    result := {unknown_trigger_result}
+}}
+
+{rule_name} contains result if {{
+    {resource_match}
+    trigger := {trigger_lookup}
+    trigger != null
+    trigger != {if_value}
+
+    result := {not_applicable_result}
+}}
+
+{rule_name} contains result if {{
+    {resource_match}
+    trigger := {trigger_lookup}
+    trigger == {if_value}
+    required := {required_lookup}
+    required == null
+
+    result := {unknown_required_result}
+}}
+
+{rule_name} contains result if {{
+    {resource_match}
+    trigger := {trigger_lookup}
+    trigger == {if_value}
+    required := {required_lookup}
+    required != null
+    required != {required_value}
+
+    result := {fail_result}
+}}
+
+{rule_name} contains result if {{
+    {resource_match}
+    trigger := {trigger_lookup}
+    trigger == {if_value}
+    required := {required_lookup}
+    required == {required_value}
+
+    result := {pass_result}
 }}
 """
 
@@ -391,43 +516,15 @@ def generate_executable_rule(policy: Policy) -> str:
     return generate_standard_rule(policy)
 
 
-def generate_combined_deny_rule(policy: Policy) -> str:
+def generate_combined_results_rule(policy: Policy) -> str:
     """
-    Add a policy-specific violation to the main deny collection.
+    Add a policy's results (whatever mix of pass/fail/unknown/
+    not_applicable it produced) to the single combined results set.
     """
     rule_name = generate_rule_name(policy)
 
-    return f"""deny contains violation if {{
-    violation := {rule_name}[_]
-}}
-"""
-
-
-def generate_manual_review_rule(policy: Policy) -> str:
-    """
-    Generate a static manual-review entry.
-
-    Manual policies are not marked compliant or non-compliant because
-    they cannot be judged from Terraform configuration alone.
-    """
-    return f"""# {policy.id}: {policy.title}
-manual_reviews contains review if {{
-    review := {{
-        "policy_id": {escape_rego_string(policy.id)},
-        "policy_source": {escape_rego_string(policy.policy_source)},
-        "reference": {escape_rego_string(policy.reference)},
-        "title": {escape_rego_string(policy.title)},
-        "description": {escape_rego_string(policy.description)},
-        "message": {escape_rego_string(policy.message)},
-        "severity": {escape_rego_string(policy.severity)},
-        "cia_category": {escape_rego_string(policy.cia_category)},
-        "automation_level": {escape_rego_string(policy.automation_level)},
-        "verification_notes": {escape_rego_string(policy.verification_notes)},
-        "resource_type": {escape_rego_string(policy.resource_type)},
-        "control": {escape_rego_string(policy.control)},
-        "operator": {escape_rego_string(policy.operator)},
-        "status": "manual_review_required"
-    }}
+    return f"""all_results contains result if {{
+    result := {rule_name}[_]
 }}
 """
 
@@ -439,29 +536,16 @@ def generate_rego(
     """
     Generate a complete Rego file.
 
-    Handling rules:
-
-    - Fully and partially automated policies become executable rules.
-    - Manual policies become manual-review entries.
-    - Unknown operators are reported as unsupported.
+    Every policy in the input is expected to be technically
+    verifiable from infrastructure evidence -- there is no manual-
+    review category. A policy whose operator this generator does not
+    recognise is reported as unsupported rather than silently dropped.
     """
     executable_rules: list[str] = []
-    combined_deny_rules: list[str] = []
-    manual_review_rules: list[str] = []
+    combined_result_rules: list[str] = []
     unsupported_policies: list[Policy] = []
 
     for policy in policies:
-        is_manual = (
-            policy.automation_level == "manual"
-            or policy.operator in MANUAL_OPERATORS
-        )
-
-        if is_manual:
-            manual_review_rules.append(
-                generate_manual_review_rule(policy)
-            )
-            continue
-
         if policy.operator not in EXECUTABLE_OPERATORS:
             unsupported_policies.append(policy)
             continue
@@ -470,8 +554,8 @@ def generate_rego(
             generate_executable_rule(policy)
         )
 
-        combined_deny_rules.append(
-            generate_combined_deny_rule(policy)
+        combined_result_rules.append(
+            generate_combined_results_rule(policy)
         )
 
     output_path.parent.mkdir(
@@ -495,16 +579,21 @@ def generate_rego(
 #       "resource_type": "storage",
 #       "controls": {
 #         "encryption_enabled": true
+#       },
+#       "metadata": {
+#         "not_applicable_controls": ["some_control"]
 #       }
 #     }
 #   ]
 # }
 #
-# Executable violations:
-# data.gdpr.deny
+# Every policy result has a status of exactly one of:
+#   pass            observed, satisfies the policy
+#   fail            observed, violates the policy
+#   unknown         could not be determined -- never assumed compliant
+#   not_applicable  the policy's question does not apply to this resource
 #
-# Manual-review policies:
-# data.gdpr.manual_reviews
+# Query: data.gdpr.all_results
 
 """
 
@@ -513,25 +602,17 @@ def generate_rego(
     if executable_rules:
         sections.append(
             "# ============================================================\n"
-            "# EXECUTABLE POLICY RULES\n"
+            "# POLICY RULES\n"
             "# ============================================================\n\n"
             + "\n".join(executable_rules)
         )
 
-    if combined_deny_rules:
+    if combined_result_rules:
         sections.append(
             "# ============================================================\n"
-            "# COMBINED POLICY VIOLATIONS\n"
+            "# COMBINED RESULTS\n"
             "# ============================================================\n\n"
-            + "\n".join(combined_deny_rules)
-        )
-
-    if manual_review_rules:
-        sections.append(
-            "# ============================================================\n"
-            "# MANUAL REVIEW POLICIES\n"
-            "# ============================================================\n\n"
-            + "\n".join(manual_review_rules)
+            + "\n".join(combined_result_rules)
         )
 
     if unsupported_policies:
@@ -562,10 +643,6 @@ def generate_rego(
     print(f"Policies received: {len(policies)}")
     print(f"Executable policies: {len(executable_rules)}")
     print(
-        f"Manual-review policies: "
-        f"{len(manual_review_rules)}"
-    )
-    print(
         f"Unsupported policies: "
         f"{len(unsupported_policies)}"
     )
@@ -577,8 +654,7 @@ def generate_rego(
         for policy in unsupported_policies:
             print(
                 f"- {policy.id}: "
-                f"operator={policy.operator}, "
-                f"automation={policy.automation_level}"
+                f"operator={policy.operator}"
             )
 
     return output_path
@@ -607,4 +683,3 @@ if __name__ == "__main__":
     ) as error:
         print(f"\nRego generation failed:\n{error}")
         raise SystemExit(1)
-        

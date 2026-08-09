@@ -6,7 +6,7 @@
   "minItems": 1,
   "items": {
     "type": "object",
-    "required": ["id","policy_source","reference","title","description","subject","action","resource_type","control","operator","expected_value","cia_category","severity","automation_level","verification_notes","message","tags"],
+    "required": ["id","policy_source","reference","title","description","subject","action","resource_type","control","operator","expected_value","cia_category","severity","verification_notes","message","tags"],
     "properties": {
       "id": {"type": "string", "minLength": 1},
       "policy_source": {"type": "string", "minLength": 1},
@@ -17,7 +17,7 @@
       "action": {"type": "string", "minLength": 1},
       "resource_type": {"type": "string", "minLength": 1},
       "control": {"type": "string", "minLength": 1},
-      "operator": {"type": "string", "enum": ["equals","not_equals","greater_than","greater_than_or_equal","less_than","less_than_or_equal","contains","not_contains","all_of","required_if","manual_review"]},
+      "operator": {"type": "string", "enum": ["equals","not_equals","greater_than","greater_than_or_equal","less_than","less_than_or_equal","contains","not_contains","all_of","required_if"]},
       "expected_value": {
         "oneOf": [
           {"type": "boolean"},
@@ -39,7 +39,6 @@
       },
       "cia_category": {"type": "string", "enum": ["Confidentiality","Integrity","Availability","Combined"]},
       "severity": {"type": "string", "enum": ["Low","Medium","High","Critical"]},
-      "automation_level": {"type": "string", "enum": ["full","partial","manual"]},
       "verification_notes": {"type": "string", "minLength": 1},
       "message": {"type": "string", "minLength": 1},
       "tags": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type":"string","minLength":1}}

@@ -16,7 +16,6 @@ class Policy:
     expected_value: Any
     cia_category: str
     severity: str
-    automation_level: str
     verification_notes: str
     message: str
     tags: list[str]

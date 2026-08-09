@@ -21,6 +21,7 @@ DEFAULT_NORMALISED_OUTPUT_PATH = (
 
 def normalise_terraform_resources(
     resources: list[dict[str, Any]],
+    references: dict[str, dict[str, list[str]]] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Send Terraform resources to provider-specific adapters.
@@ -37,11 +38,92 @@ def normalise_terraform_resources(
 
     normalised_resources.extend(
         normalise_aws_resources(
-            aws_resources
+            aws_resources,
+            references,
         )
     )
 
     return normalised_resources
+
+
+def extract_configuration_references(
+    terraform_plan: dict[str, Any],
+) -> dict[str, dict[str, list[str]]]:
+    """
+    Build a map of resource address -> {argument_name: [referenced
+    addresses]} from the plan's `configuration` block.
+
+    planned_values only has resolved values, so if an attribute isn't
+    known yet (like an ID that AWS generates), it's just missing. But
+    `configuration` still records what each argument was set to point
+    at, e.g. `role = aws_iam_role.example.id`, even though we don't
+    know the actual ID yet. That lets the adapter link a role to its
+    policy by following this reference instead of assuming they share
+    a Terraform name - which isn't always true (found this with
+    TerraGoat, where the role and its policy have different names).
+    """
+    configuration = terraform_plan.get("configuration")
+
+    if not isinstance(configuration, dict):
+        return {}
+
+    root_module = configuration.get("root_module")
+
+    if not isinstance(root_module, dict):
+        return {}
+
+    references: dict[str, dict[str, list[str]]] = {}
+
+    def walk_module(module: dict[str, Any]) -> None:
+        module_resources = module.get("resources", [])
+
+        if isinstance(module_resources, list):
+            for resource in module_resources:
+                if not isinstance(resource, dict):
+                    continue
+
+                address = resource.get("address")
+                expressions = resource.get("expressions")
+
+                if not isinstance(address, str):
+                    continue
+
+                if not isinstance(expressions, dict):
+                    continue
+
+                attribute_references: dict[str, list[str]] = {}
+
+                for argument_name, expression in expressions.items():
+                    if not isinstance(expression, dict):
+                        continue
+
+                    referenced_addresses = expression.get("references")
+
+                    if isinstance(referenced_addresses, list):
+                        attribute_references[argument_name] = [
+                            reference
+                            for reference in referenced_addresses
+                            if isinstance(reference, str)
+                        ]
+
+                if attribute_references:
+                    references[address] = attribute_references
+
+        module_calls = module.get("module_calls", {})
+
+        if isinstance(module_calls, dict):
+            for module_call in module_calls.values():
+                if not isinstance(module_call, dict):
+                    continue
+
+                nested_module = module_call.get("module")
+
+                if isinstance(nested_module, dict):
+                    walk_module(nested_module)
+
+    walk_module(root_module)
+
+    return references
 
 
 def save_normalised_infrastructure(
@@ -237,8 +319,42 @@ def load_terraform_plan_resources(
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Load a Terraform plan JSON file, normalise its "
+            "resources, and save the result."
+        ),
+    )
+
+    parser.add_argument(
+        "--plan",
+        type=Path,
+        default=DEFAULT_TERRAFORM_PLAN_PATH,
+        help=(
+            "Path to a tfplan.json file. Defaults to the aws_test "
+            "example: "
+            f"{DEFAULT_TERRAFORM_PLAN_PATH}"
+        ),
+    )
+
+    args = parser.parse_args()
+
     try:
-        planned_resources = load_terraform_plan_resources()
+        terraform_plan = load_json(args.plan)
+
+        planned_resources = extract_planned_resources(
+            terraform_plan
+        )
+
+        print("\nTerraform plan loaded successfully.")
+        print(f"Plan file: {args.plan}")
+        print(f"Resources found: {len(planned_resources)}")
+
+        configuration_references = extract_configuration_references(
+            terraform_plan
+        )
 
         print_resource_summary(
             planned_resources
@@ -246,7 +362,8 @@ if __name__ == "__main__":
 
         normalised_resources = (
             normalise_terraform_resources(
-                planned_resources
+                planned_resources,
+                configuration_references,
             )
         )
 
